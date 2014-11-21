@@ -1,0 +1,191 @@
+// Arduino Wire library is required if I2Cdev I2CDEV_ARDUINO_WIRE implementation is used in I2Cdev.h
+#include "Wire.h"
+
+#include <Sprite.h>
+#include <Matrix.h>
+
+Matrix myMatrix = Matrix(2, 4, 3, 1 /* 1 screen*/);
+/* create a new Sprite instance 8 pixels wide, 4 pixels tall */
+Sprite wave = Sprite(  8, 8,
+  B00000000,
+  B00000000,
+  B00011000,
+  B00100100,
+  B01000010,
+  B10000001,
+  B00000000,
+  B00000000
+);
+
+// I2Cdev and MPU6050 must be installed as libraries, or else the .cpp/.h files
+// for both classes must be in the include path of your project
+#include "I2Cdev.h"
+#include "MPU6050.h"
+// class default I2C address is 0x68
+// specific I2C addresses may be passed as a parameter here
+// AD0 low = 0x68 (default for InvenSense evaluation board)
+// AD0 high = 0x69
+MPU6050 accelgyro;
+
+int16_t ax, ay, az;
+int16_t gx, gy, gz;
+
+#define LED_PIN 13
+bool blinkState = false;
+
+#include <Servo.h>
+Servo myservo1;  // create servo objects to control servos
+Servo myservo2;
+
+int potpin1 = 0;  // analog pin used to connect the potentiometer
+const byte averageFactor = 3;   // коэффициент сглаживания показаний (0 = не сглаживать)
+                                // чем выше, тем больше "инерционность"
+int val;    // variable to read the value from the analog pin
+int val0;   // previous value
+
+int pos1=90;    // new position
+int pos2=90;    // 2nd servo position
+int d;       // delay from potentiometer
+int b = 100; // blink rate - one blink per 100 loops
+unsigned long dTime; // timestamp for movements and tests
+int dt;      // loop time in milliseconds
+
+void setup()
+{
+// join I2C bus (I2Cdev library doesn't do this automatically)
+  Wire.begin();
+  Serial.begin(115200);
+// initialize device
+  Serial.println("Initializing I2C devices...");
+  accelgyro.initialize();
+
+// verify connection
+  Serial.println("Testing device connections...");
+  Serial.println(accelgyro.testConnection() ? "MPU6050 connection successful" : "MPU6050 connection failed");
+
+// configure Arduino LED for
+  pinMode(LED_PIN, OUTPUT);
+
+  myservo1.attach(10);  // attaches the servo on pin 10    
+  myservo2.attach(9);  // attaches the servo on pin 9
+
+  
+  
+//set starting position according input
+/*
+  val = readSensor(5);
+  pos1 = map(val, 10, 1000, 0, 180);     // scale it between 0 and 180
+  pos2 = constrain(pos1, 0, 180);
+  myservo1.write(pos1);   
+  myservo2.write(pos2);
+  delay(3);
+*/
+
+ dTime = millis();
+}
+
+void loop()
+{
+  static byte x;
+  myMatrix.write(x, 0, wave);     // place sprite on screen
+  myMatrix.write(x - 8, 0, wave); // place sprite again, elsewhere on screen
+  
+  dt = millis() - dTime; // time since previous measurement
+  dTime = millis();
+
+//these methods (and a few others) are available  
+  accelgyro.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+//  accelgyro.getAcceleration(&ax, &ay, &az);
+//  accelgyro.getRotation(&gx, &gy, &gz);
+//  default set +/- 250 degree per secong 
+//  setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+
+//  pos1 = pos1 - dt*map( gz, -32768, 32768, -250, 250)/1000;
+//  pos2 = pos2 + dt*map( gy, -32768, 32768, -250, 250)/1000;
+  pos1 = pos1 - dt * (gz / 131)/1000;
+  pos2 = pos2 + dt * (gy / 131)/1000;
+
+  // Convert accelerometer raw values to degrees
+  double accZangle = (atan2(ay, ax) + PI) * RAD_TO_DEG;
+  double accYangle = (atan2(ax, az) + PI) * RAD_TO_DEG;
+
+  // Convert raw gyro values to degrees per second
+  double gyroZrate = ((double)gz / 131.0);
+  double gyroYrate = ((double)gy / 131.0);
+
+  // Calculate angles using complementary filter
+//static int  pos01 = (0.93 * (pos01 + (gyroZrate * dt / 1000))) + (0.07 * accZangle);
+//static int  pos02 = (0.93 * (pos02 + (gyroYrate * dt / 1000))) + (0.07 * accYangle);
+
+  pos1 = constrain(pos1, 0, 180);
+  pos2 = constrain(pos2, 0, 180);
+  
+  myservo1.write(pos1);
+  myservo2.write(pos2);
+
+  // read delay value from potentiometer - need to have value from zero to 1000 msc
+  //d = map(analogRead(potpin1)/10, 10, 100, 0, 1000);
+  //d = constrain(d, 0, 1000);
+  d = 10;
+  
+  // display tab-separated accel/gyro x/y/z values
+  Serial.print(gx); Serial.print("\t"); 
+  Serial.print(gy); Serial.print("\t"); 
+  Serial.print(gz); Serial.print("\t"); 
+  Serial.print(ax); Serial.print("\t");
+  Serial.print(ay); Serial.print("\t"); 
+  Serial.print(az); Serial.print("\t"); 
+  Serial.print(pos1); Serial.print("\t");
+  Serial.print(pos2); Serial.print("\t");
+  Serial.print(accZangle); Serial.print("\t");
+  Serial.print(accYangle); Serial.print("\t");
+
+  Serial.print( dt ); Serial.print("\t");
+  
+  // The temperature sensor is -40 to +85 degrees Celsius.
+  // It is a signed integer.
+  // According to the datasheet:
+  // 340 per degrees Celsius, -512 at 35 degrees.
+  // At 0 degrees: -512 - (340 * 35) = -12412
+//  Serial.print((accelgyro.getTemperature() + 12412.0) / 340.0); Serial.print(" C\t");
+  Serial.println("\t");
+
+
+  // blink LED to indicate activity
+    b--;
+    if (b <= 0) {
+      blinkState = !blinkState;
+      digitalWrite(LED_PIN, blinkState);
+      b = 100;
+    };
+
+  delay(d);                      // wait a little bit
+  myMatrix.clear();               // clear the screen for next animation frame
+  if(x == 8)  x = 0;  // if reached end of animation sequence start from beginning
+  x++; 
+}
+
+int readSensor(int samples){ 
+    unsigned int avg_sum=0;
+    if (samples <= 0) {samples = 1;};
+    for(byte i = 0; i < samples; i++ ){
+       avg_sum += constrain(analogRead(potpin1), 0, 1023);
+       delay(1);
+   }
+   return avg_sum/samples;
+}
+
+void Move2Servos (int p1, int p2) {
+  int p01 = myservo1.read();
+  int p02 = myservo2.read();
+  if ((abs(p01-p1) > 2 ) || (abs(p02-p2) > 2 )) {
+  while ((p01 != p1) && (p02 != p2)) {
+     if (p01 > p1) { myservo1.write(--p01); };
+     if (p01 < p1) { myservo1.write(++p01); };
+     if (p02 > p2) { myservo2.write(--p02); };
+     if (p02 < p2) { myservo2.write(++p02); };
+     delay(1);
+    } 
+  }
+}  

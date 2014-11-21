@@ -1,0 +1,670 @@
+/* ===================================================================== */
+/* Nik Volk Arduino UNO with BT link to Android remote control or sensor */
+/* ===================================================================== */
+/*  To do: 
+ * Connect Front and Back Light to the Pin 12 and Pin 3
+ * Add charging socket and 2S Li Ion battery protection circuit 
+ *     then remove VCC measure circuit and re-use A3 pin
+ * Connect whell encoders and test rotation adjustment based on encoder reads
+ */
+//----------------------------
+#define __debug__
+#ifdef __debug__
+  #define DEBUG_PRINT(x)    Serial.print (x)
+  #define DEBUG_PRINTDEC(x) Serial.print (x, DEC)
+  #define DEBUG_PRINTLN(x)  Serial.println (x)
+#else
+  #define DEBUG_PRINT(x)
+  #define DEBUG_PRINTDEC(x)
+  #define DEBUG_PRINTLN(x) 
+#endif
+// Example of use:
+// DEBUG_PRINT("pressCounter = ");
+// DEBUG_PRINTDEC(pressCounter);
+
+//----------------------------
+// Pins Assigment Arduino UNO:
+// Serial (BT or USB)
+#define bt_rx      0 // -> connect to tx
+#define bt_tx      1 // -> resistive divider here: 2p12k to rx and 12k to GND
+#define __encoders__
+#ifdef (__encoders__)
+// Encoders
+   #define encoderPinA 2
+   #define encoderPinB 3
+#else
+// or Button and Lights 
+   #define B1          2 // Low when pressed (0 or false)
+   #define LB          3 // Back Light 2 Red LED
+#endif
+
+// Define physical constants of the wheel for wheel encoding
+#define WHEEL_CIRCUMFERENCE 0.212 // In meters
+#define WHEEL_TICKS 40            // The number of 'ticks' for a full wheel cycle
+#define WHEEL_DIST 0.12           // The distance between wheels in meters
+
+// Ultrasonic distance sensor
+#define u_trig     4 // ping
+#define u_echo     5 // pong
+//---------------------------
+// Motor B Left Motor
+#define speedPinB  6 // PWM speed control
+#define dir2PinB   7 // direction control
+#define dir1PinB   8 // direction control
+// Motor A Right Motor
+#define dir1PinA   9 // direction control
+#define dir2PinA  10 // direction control
+#define speedPinA 11 // PWM speed control
+//---------------------------
+#define LF        12 // Front Light 2 White or Blue LED
+// Beeper & Blinking Led
+#define u_tone    13 // piezo 
+#define LED       13 // built in led
+// Line Detectors  1 - Dark Line,  0 - White Space
+#define ld_left   A0 // D14
+#define ld_center A1 // D15
+#define ld_right  A2 // D16
+#define BatVcc    A3 // Battery direct Voltage from motors driver via /3 divider (24k/12k)
+#define XT      NULL //
+#define _SDA      A4 // (Data) output of compass to analog pin 4
+#define _SDL      A5 // (Clock) output of compass to analog pin 5
+//--------------------------------------------------------------
+#define Vmin 6000 // mV, Minimal Battery voltage allowed for operation: 3v+3v=6v
+// =============================================================
+#include "Ultrasonic.h"
+Ultrasonic ultrasonic(u_trig, u_echo);
+
+// Get heading from the HMC5883L compass module X-> direction forward
+#include <Wire.h>
+#include <HMC5883L.h>
+HMC5883L compass;
+int heading; // 0 - 359 degrees
+
+// Line sensor read   1 - Line,  0 - No Line
+byte sr; // Right
+byte sc; // Center
+byte sl; // Left
+
+// Set motor speed for straight forward moving
+byte ssd = 0;   // Adjust speed for right motor-ssd and left motor+ssd to allign straight moving
+
+int Vcc; // Battery voltage 7400mV
+int VccInt; // Internal arduino voltage ~ 5000mV
+byte _usb_; // flag for powering from USB connector
+
+#ifdef (__encoders__)
+// Set motor speed for straight forward moving
+int ssA = 205;
+int ssB = 205;
+
+volatile unsigned long encoderAPos=0;
+volatile unsigned long encoderBPos=0;
+
+unsigned long newAposition;
+unsigned long oldAposition = 0;
+unsigned long newBposition;
+unsigned long oldBposition = 0;
+unsigned long newtime;
+unsigned long oldtime = 0;
+int velA;
+int velB;
+
+int sA=120;
+int sB=120;
+
+int ss = 0; // difference in A and B positions
+
+double velocityA;
+double velocityB;
+
+void doEncoderA(){encoderAPos++;}
+void doEncoderB(){encoderBPos++;}
+
+// Function reads encoder data and corrects wheel speed
+void encoder_loop() {
+   
+   newAposition = encoderAPos;
+   newBposition = encoderBPos;
+   newtime = millis();
+   velA = (newAposition-oldAposition)*1000 /(newtime-oldtime);
+   velB = (newBposition-oldBposition)*1000 /(newtime-oldtime);
+   
+   // Convert between angular velocity to velocity
+   double angVelA = velA / (double)WHEEL_TICKS;
+   velocityA = (angVelA * WHEEL_CIRCUMFERENCE);
+   
+   double angVelB = velB / (double)WHEEL_TICKS;
+   velocityB = (angVelB * WHEEL_CIRCUMFERENCE);
+
+   Serial.print (newBposition); Serial.print ("  "); Serial.println (newAposition);
+   Serial.print (newBposition-oldBposition); Serial.print ("  "); Serial.println (newAposition-oldAposition);
+   
+   Serial.print ("vB="); Serial.print (velB);
+   Serial.print (" vA="); Serial.println (velA);
+   Serial.print ("ss="); Serial.println (ss);
+   
+   // Print velocity (m/s) to serial line
+   Serial.print("LVel(B): ");PrintDouble(velocityB, 4);
+   Serial.print(" RVel(A): ");PrintDouble(velocityA, 4);
+   Serial.println ("");
+   
+   oldAposition = newAposition;
+   oldBposition = newBposition;
+   oldtime = newtime;
+   
+   // adjust absolute wheel position
+   ss = 1 * (newAposition - newBposition);
+   
+   // Correct motor speed to meet values set in sA an sB
+   ssA += (sA-velA)/12; //if (velA > sA) ssA--; else ssA++;
+   ssB += (sB-velB)/12; //if (velB > sB) ssB--; else ssB++;
+   //motor_speed(ssB+ss,ssA-ss);
+   //delay(200);
+}
+#endif
+
+//soft-reset function - restart arduino
+//check if this could be used for wireless programming
+/* ******************************************************************* */  
+void(* resetFunc) (void) = 0; /*   declare reset function at address 0 */
+/* ******************************************************************* */  
+// Read Free SRAM in bytes 
+int freeRam () {
+  extern int __heap_start, *__brkval; 
+  int v; 
+  return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval); 
+}
+/* ******************************************************************* */  
+
+void setup() 
+{ 
+  Serial.begin(38400); // check the default speed on the BT module, it should match
+  pinMode(BatVcc, INPUT);
+  
+#ifdef (__encoders__)
+  pinMode(encoderPinA, INPUT_PULLUP); // turn on pullup resisto
+  pinMode(encoderPinB, INPUT_PULLUP); // turn on pullup resistor
+  // CHANGE to trigger the interrupt whenever the pin changes value
+  attachInterrupt(0, doEncoderA, CHANGE); // encoderA ON PIN 2  RISING or FALLING
+  attachInterrupt(1, doEncoderB, CHANGE;  // encoderB ON PIN 3  RISING or FALLING
+#else
+  // Button, LED
+  pinMode(B1,  INPUT_PULLUP);
+  pinMode(LED, OUTPUT);
+#endif 
+  blink(5);
+  //Check internal voltage and postpone when low
+  while (!Check_voltage()) {delay(1000); blink(3);}
+  
+  // initialize pins for motors
+  pinMode(dir1PinA,  OUTPUT);
+  pinMode(dir2PinA,  OUTPUT);
+  pinMode(speedPinA, OUTPUT);
+  pinMode(dir1PinB,  OUTPUT);
+  pinMode(dir2PinB,  OUTPUT);
+  pinMode(speedPinB, OUTPUT);
+  motor_speed (0, 0);
+  
+  // initialize pins for line detectors
+  pinMode(ld_left,   INPUT);
+  pinMode(ld_center, INPUT);
+  pinMode(ld_right,  INPUT);
+  
+  //wait  for button pressed 
+  //while (digitalRead(B1)) { delay(500); blink(1);}
+  
+  start_tone();
+  
+  //setup the HMC5883L Compass
+  Wire.begin();
+  compass = HMC5883L(); //new instance of HMC5883L library
+  setupHMC5883L();
+  // set initial direction
+  heading = getHeading();
+  _usb_ = ((readVccInt() < 5030)?1:0); //5023 USB power, 5046 battery
+} //setup
+
+void loop() {
+  char val ='0';  // char received from serial (e.g. over Bluetooth)
+  byte spd = 0;   // current motor speed 0 - 255
+  int ddf; // tilt value for compass course correction
+  
+  _usb_ = ((readVccInt() < 5030)?1:0); //5023 USB power, 5046 battery
+  
+  // set a new course if previous command was turning somewere
+  if ((val=='L')||(val=='R')||(val=='G')||(val=='I')||(val=='H')||(val=='J')) {heading = getHeading();}
+  
+  // Read a new command from serial
+  if( Serial.available() ) // if data is available to read
+   {
+    val = Serial.read();   // read it and store it in 'val'
+   }
+  
+//#if defined (__debug__)   
+if (_usb_) {
+  //heading = getHeading();
+  Serial.println(val);
+  Serial.print(heading); Serial.print("  "); Serial.println(DriveCompassDiff(heading));
+  Serial.print(ultrasonic.Ranging(CM)); Serial.println("cm"); 
+  Serial.println(readVccInt());
+  delay(700);
+}
+//#endif
+  const byte k=1;
+  switch (val) {
+     case '0' ... '9': { spd = (val-'0')*15+100; break;}
+     case 'q': { spd = 255; break;}
+     case 'F': { 
+     #ifdef(__encoders__)
+        ddf=k*ss; 
+     #else 
+        ddf=k*DriveCompassDiff(heading);
+     #endif
+     motor_speed ( spd-ddf, spd+ddf); break;}
+     case 'B': { 
+     #ifdef(__encoders__)
+        ddf=-k*ss; 
+     #else 
+        ddf=-k*DriveCompassDiff(heading);
+     #endif
+     motor_speed (-spd-ddf,-spd+ddf); break;}
+     case 'L': { motor_speed (-spd,     spd); break;} // Turn Left on the spot
+     case 'R': { motor_speed ( spd,    -spd); break;} // Turn Right on the spot
+     case 'G': { motor_speed ( spd*2/3, spd); break;} // Forward Left
+     case 'I': { motor_speed ( spd, spd*2/3); break;} // Forward Right
+     case 'H': { motor_speed (-spd*2/3,-spd); break;} // Back Left
+     case 'J': { motor_speed (-spd,-spd*2/3); break;} // Back Right
+     case 'S': { motor_speed ( 0,         0); break;} // Stop
+     case 'W': { digitalWrite(LF, HIGH); break;}      // Front Light On
+     case 'w': { digitalWrite(LF, LOW); break;}       // Front Light Off
+     #ifdef(__encoders__)
+     #else 
+     case 'U': { digitalWrite(LB, HIGH); break;}      // Back Light On
+     case 'u': { digitalWrite(LB, LOW); break;}       // Back Light Off
+     #endif
+     case 'V': { tone(u_tone, 200, 100); tone(u_tone, 100, 100); break;} // Horn On
+     case 'v': { noTone(u_tone); break;}              // Horn Off
+     case 'X': { heading = getHeading(); 
+                 digitalWrite(XT, HIGH); break;}      // Extra On and re-set course
+     case 'x': { heading = ((getHeading()+180 >= 360)?getHeading()-180:getHeading()+180); 
+                 digitalWrite(XT, LOW); break;}       // Extra Off and reverse course
+     case 'D': { motor_speed (0,0); break;}           // All Stop
+     default:  { motor_speed (0,0); break;}           // All Stop
+  }
+  
+  if (ultrasonic.Ranging(CM) < 20) { // very close to bump - stop and move backward a bit
+    motor_speed (0, 0);
+    tone(u_tone, 904, 50);
+    delay(100);
+    motor_speed (-205, -205); 
+    tone(u_tone, 404, 100); 
+    delay(500);
+    noTone(u_tone);
+    while (ultrasonic.Ranging(CM) < 150) {
+       motor_speed (-200, 200); //turn left until space is clear
+       tone(u_tone, 504, 20); 
+       delay(10);
+       noTone(u_tone);
+    }
+    motor_speed (0, 0);
+    noTone(u_tone);
+    //heading = getHeading();
+  }
+#ifdef (__encoders__)
+#else
+  // stop and set a new course on B1 pressed after 2s pause 
+  if (!(digitalRead(B1))) {
+    motor_speed (0,0);
+    delay(100);
+    for (int i=1; i<=12; i++) {tone(u_tone, 494+494/i, 60); delay(50); noTone(u_tone);}
+    delay(2000);
+    heading = getHeading();
+  }
+  
+  // Check internal voltage, stop and wait B! pressed if it's low or restored to safe level
+  if (!Check_voltage()) {
+      while (!(digitalRead(B1)) && !Check_voltage()) {
+         delay(300);
+         blink(2);
+      }
+  }
+#endif
+} // loop
+
+// course correction to move on the sright line
+int DriveCompassDiff(int direct) {
+  const int err=0; // degrees error in direction 
+  // read the compass orientation how many degrees are we off
+  int diff = getHeading()-direct;
+  if (abs(diff) < err) return 0; // ignore small discrepancies
+  
+  // modify degress to +/- 180 turn 
+  if (diff > 180) diff = -360+diff;
+  diff = map(diff, -180, 180, -255, 255);
+  
+  return diff;
+}
+
+void setupHMC5883L(){
+  //Setup the HMC5883L, and check for errors
+  int error;  
+  error = compass.SetScale(1.3); //Set the scale of the compass.
+  if(error != 0) Serial.println(compass.GetErrorText(error)); //check if there is an error, and print if so
+  error = compass.SetMeasurementMode(Measurement_Continuous); // Set the measurement mode to Continuous
+  if(error != 0) Serial.println(compass.GetErrorText(error)); //check if there is an error, and print if so
+}
+
+int getHeading(){
+  //Get the reading from the HMC5883L and calculate the heading
+  MagnetometerScaled scaled = compass.ReadScaledAxis(); //scaled values from compass.
+  float fheading = atan2(scaled.YAxis, scaled.XAxis);
+  
+  // Correct for when signs are reversed.
+  if(fheading < 0) fheading += 2*PI;
+  if(fheading > 2*PI) fheading -= 2*PI;
+  fheading *= RAD_TO_DEG; //radians to degrees
+  
+  return int(fheading);
+}
+
+// Set motors speed and direction
+void motor_speed (int vl, int vr) {
+
+  byte SpeedLeft;
+  byte SpeedRight;
+  char dr;
+ 
+  if ((vr== 0) && (vl== 0)) {dr = 'S';}
+  if ((vr > 0) && (vl > 0)) {dr = 'F';}
+  if ((vr < 0) && (vl < 0)) {dr = 'B';}
+  if ((vr > 0) && (vl<= 0)) {dr = 'L';}
+  if ((vr<= 0) && (vl > 0)) {dr = 'R';}
+
+  SpeedLeft = constrain(abs(vl), 0,255);
+  SpeedRight = constrain(abs(vr), 0,255);
+  
+  analogWrite(speedPinB, SpeedLeft);  // Left Motor
+  analogWrite(speedPinA, SpeedRight-(((dr == 'F')||(dr == 'B'))?ssd:0)); // Right Motor
+                                 // reduce right motor speed only on move straight (F/B)
+  // start motor move in the needed direction with set speed
+  motor_move(dr);
+  
+//#if defined (__debug__)  
+if (_usb_) {
+  Serial.print("vl="); Serial.print(vl); Serial.print(" vr="); Serial.println(vr); 
+  Serial.print("SL="); Serial.print(SpeedLeft);  Serial.print(" SR="); Serial.println(SpeedRight); 
+  delay(500);
+}
+//#endif 
+}
+
+// set direction
+void motor_move (char dir)
+{  
+  //#if defined (__debug__)  
+if (_usb_) {
+  Serial.print("dir="); Serial.println(dir); delay(100);
+}
+//#endif  
+  switch (dir) { 
+        case 'B':
+        {   digitalWrite(dir1PinA, LOW); 
+            digitalWrite(dir2PinA, HIGH);
+            digitalWrite(dir1PinB, HIGH);
+            digitalWrite(dir2PinB, LOW);
+            break;
+        }
+        case 'F':
+        {   digitalWrite(dir1PinA, HIGH);
+            digitalWrite(dir2PinA, LOW);
+            digitalWrite(dir1PinB, LOW);
+            digitalWrite(dir2PinB, HIGH);
+            break;
+        }
+        case 'L':
+        {   digitalWrite(dir1PinA, HIGH);
+            digitalWrite(dir2PinA, LOW);
+            digitalWrite(dir1PinB, HIGH);
+            digitalWrite(dir2PinB, LOW);
+            break;
+        }  
+        case 'R':
+        {   digitalWrite(dir1PinA, LOW); 
+            digitalWrite(dir2PinA, HIGH);
+            digitalWrite(dir1PinB, LOW);
+            digitalWrite(dir2PinB, HIGH);
+            break;
+        }
+        case 'S':
+        {  //Brake //Stop
+            digitalWrite(dir1PinA, HIGH);
+            digitalWrite(dir2PinA, HIGH);
+            digitalWrite(dir1PinB, HIGH);
+            digitalWrite(dir2PinB, HIGH);
+            break;
+        }
+        default: 
+        { // Coast // Stop
+            digitalWrite(dir1PinA, LOW);
+            digitalWrite(dir2PinA, LOW);
+            digitalWrite(dir1PinB, LOW);
+            digitalWrite(dir2PinB, LOW);
+            break;
+        }
+    }
+}
+
+
+// Check Battery voltage and sleep when it's very low during several reads
+bool Check_voltage() {
+   Vcc = readVcc(); // switch robot off when VCC < VMin
+   VccInt = readVccInt();
+//#if defined (__debug__)  
+if (_usb_) {
+   Serial.print("Vcc    = "); Serial.println(Vcc);
+   Serial.print("VccInt = "); Serial.println(VccInt);
+   delay(500);
+}
+//#endif 
+  byte rd = 0;
+  while ((Vcc < Vmin) and not(_usb_)) { // disable check when powered from USB
+    rd++; 
+    if (rd > 5) {
+       motor_speed (0, 0);
+       for (int i=1; i<=5; i++) {tone(u_tone, 294+294/i, 50); delay(50); noTone(u_tone);}
+       return false; 
+     //resetFunc();
+    }
+    Vcc = readVcc();
+    VccInt = readVccInt();
+  }
+  return true;
+}
+
+// Read Battery voltage 2S LiPo ~7.4V
+int readVcc() { 
+  analogReference(DEFAULT); // the default analog reference of 5 volts (on 5V Arduino boards)
+  const byte samples = 2;
+  unsigned int avg_sum = 0;
+  static int val0;
+  static int val = analogRead(BatVcc);
+  const byte averageFactor = 2;   // коэффициент сглаживания показаний (0 = не сглаживать)
+                                  // чем выше, тем больше "инерционность"
+  for(byte i = 0; i < samples; i++){
+      avg_sum += analogRead(BatVcc);
+      delay(2); // небольшая пауза между замерами
+    }
+  val0 = val;
+  val = avg_sum/samples;        // reads the value of the pot
+  if (averageFactor > 0) {      // усреднение показаний для устранения "скачков"  
+        val = (val0 * (averageFactor - 1) + val) / averageFactor; 
+      } // <новое среднее> = (<старое среднее>*(averageFactor-1) + <текущее значение>) / averageFactor  
+  return map(val, 0,1023, 0,5000*2); // R2/(R1+R2) 12/(12+12) = 2 
+}
+
+//Read Internal Voltage ~5V
+int readVccInt() {
+  // Read 1.1V reference against AVcc
+  // set the reference to Vcc and the measurement to the internal 1.1V reference
+  #if defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
+    ADMUX = _BV(REFS0) | _BV(MUX4) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  #elif defined (__AVR_ATtiny24__) || defined(__AVR_ATtiny44__) || defined(__AVR_ATtiny84__)
+    ADMUX = _BV(MUX5) | _BV(MUX0);
+  #elif defined (__AVR_ATtiny25__) || defined(__AVR_ATtiny45__) || defined(__AVR_ATtiny85__)
+    ADMUX = _BV(MUX3) | _BV(MUX2);
+  #else
+    ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  #endif  
+ 
+  delay(2); // Wait for Vref to settle
+  ADCSRA |= _BV(ADSC); // Start conversion
+  while (bit_is_set(ADCSRA,ADSC)); // measuring
+ 
+  uint8_t low  = ADCL; // must read ADCL first - it then locks ADCH  
+  uint8_t high = ADCH; // unlocks both
+ 
+  long result = (high<<8) | low;
+ 
+  result = 1125300L / result; // Calculate Vcc (in mV); 1125300 = 1.1*1023*1000
+  return int(result); // Vcc in millivolts
+}
+
+// Read line sensors: 0 - black or hole,  1 - white or very close object
+void read_line()
+{ sl = digitalRead(ld_left);
+  sc = digitalRead(ld_center);
+  sr = digitalRead(ld_right);
+  
+//#if defined (__debug__)  
+  if (_usb_) {
+    Serial.print('read_line: '); 
+    Serial.print(sl); Serial.print(' '); 
+    Serial.print(sc); Serial.print(' '); 
+    Serial.println(sr);
+  }
+//#endif 
+}
+
+// blink N times with 30ms interval (adds 60ms delay per 1 blink)
+void blink(int n) 
+{ for (int i = 1; i <= n; i++) 
+    {
+       digitalWrite(LED, HIGH);   // blink the LED
+       delay(30);                 
+       digitalWrite(LED, LOW);    // turn the LED off by making the voltage LOW
+       delay(30);                 
+    }
+}
+
+// play start tone melody
+/*************************************************
+ * Public Constants
+ *************************************************/
+#define NOTE_B0  31
+#define NOTE_C1  33
+#define NOTE_CS1 35
+#define NOTE_D1  37
+#define NOTE_DS1 39
+#define NOTE_E1  41
+#define NOTE_F1  44
+#define NOTE_FS1 46
+#define NOTE_G1  49
+#define NOTE_GS1 52
+#define NOTE_A1  55
+#define NOTE_AS1 58
+#define NOTE_B1  62
+#define NOTE_C2  65
+#define NOTE_CS2 69
+#define NOTE_D2  73
+#define NOTE_DS2 78
+#define NOTE_E2  82
+#define NOTE_F2  87
+#define NOTE_FS2 93
+#define NOTE_G2  98
+#define NOTE_GS2 104
+#define NOTE_A2  110
+#define NOTE_AS2 117
+#define NOTE_B2  123
+#define NOTE_C3  131
+#define NOTE_CS3 139
+#define NOTE_D3  147
+#define NOTE_DS3 156
+#define NOTE_E3  165
+#define NOTE_F3  175
+#define NOTE_FS3 185
+#define NOTE_G3  196
+#define NOTE_GS3 208
+#define NOTE_A3  220
+#define NOTE_AS3 233
+#define NOTE_B3  247
+#define NOTE_C4  262
+#define NOTE_CS4 277
+#define NOTE_D4  294
+#define NOTE_DS4 311
+#define NOTE_E4  330
+#define NOTE_F4  349
+#define NOTE_FS4 370
+#define NOTE_G4  392
+#define NOTE_GS4 415
+#define NOTE_A4  440
+#define NOTE_AS4 466
+#define NOTE_B4  494
+#define NOTE_C5  523
+#define NOTE_CS5 554
+#define NOTE_D5  587
+#define NOTE_DS5 622
+#define NOTE_E5  659
+#define NOTE_F5  698
+#define NOTE_FS5 740
+#define NOTE_G5  784
+#define NOTE_GS5 831
+#define NOTE_A5  880
+#define NOTE_AS5 932
+#define NOTE_B5  988
+#define NOTE_C6  1047
+#define NOTE_CS6 1109
+#define NOTE_D6  1175
+#define NOTE_DS6 1245
+#define NOTE_E6  1319
+#define NOTE_F6  1397
+#define NOTE_FS6 1480
+#define NOTE_G6  1568
+#define NOTE_GS6 1661
+#define NOTE_A6  1760
+#define NOTE_AS6 1865
+#define NOTE_B6  1976
+#define NOTE_C7  2093
+#define NOTE_CS7 2217
+#define NOTE_D7  2349
+#define NOTE_DS7 2489
+#define NOTE_E7  2637
+#define NOTE_F7  2794
+#define NOTE_FS7 2960
+#define NOTE_G7  3136
+#define NOTE_GS7 3322
+#define NOTE_A7  3520
+#define NOTE_AS7 3729
+#define NOTE_B7  3951
+#define NOTE_C8  4186
+#define NOTE_CS8 4435
+#define NOTE_D8  4699
+#define NOTE_DS8 4978
+
+void start_tone() {
+int melody[] = {NOTE_C4, NOTE_G3, NOTE_G3, NOTE_A3, NOTE_G3, 0, NOTE_B3, NOTE_C4};
+// note durations: 4 = quarter note, 8 = eighth note, etc.:
+int noteDurations[] = {4, 8, 8, 4, 4, 4, 4, 4};
+  // iterate over the notes of the melody:
+  for (int thisNote = 0; thisNote < 8; thisNote++) {
+    // to calculate the note duration, take one second divided by the note type.
+    //e.g. quarter note = 1000 / 4, eighth note = 1000/8, etc.
+    int noteDuration = 1000/noteDurations[thisNote];
+    tone(u_tone, melody[thisNote], noteDuration);
+    // to distinguish the notes, set a minimum time between them.
+    // the note's duration + 30% seems to work well:
+    int pauseBetweenNotes = noteDuration * 1.30;
+    delay(pauseBetweenNotes);
+    // stop the tone playing:
+    noTone(u_tone);
+    }
+}

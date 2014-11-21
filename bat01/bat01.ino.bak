@@ -1,0 +1,781 @@
+/* ****************************************************************************
+ *                        Battery Capacity Tester v.01                        *
+ * ****************************************************************************
+  Works with a ULN2803A (up to 0.5A load on pin)
+  Load resistors activated using 74HC595 shift register with Led indicators
+  Handles batteries from 0.5 - 15.0 Volts
+  Load resistors, Ohm: 1,2,4,8,16,32,64,128 (1-2W)
+  Read voltage via divider 12K and 2*12K giving ratio of 1:3
+  
+  Project changes to do:
+  * Add 0.1 uf between each analog read pin and GND (A0,A6,A7) for ADC noise reduction.
+    http://forum.arduino.cc/index.php?PHPSESSID=sfmdbltj8j3kh2ukodr67h6765&topic=45949.0 
+  * Connect Voltage sensor to the relay clemm (arduino side)
+  * Use thick wires for main load and battery connection
+  * Calibrate Amp readings: whether it 5A, 10A or 20A max reading - use Ampermeter in series
+  * Add a 0.1 uf capacitor on relay clemms  
+  * Add wire to relay pin3 to short circuit current and voltage sensors to GND for zero reading
+  * Add a diode or two (in parallell) to protect from reverse polarity of battery connection
+  * !!! No Aref on MiniPro !!! Try to set 3.3v Zener diode for external ARef voltage
+  * Figure out a pcb layout for this tester and a box for it
+  
+ **** Pin allocation: ******** 
+  Pin A0        Thermistor
+ **** Direct set load (OR via shift register)
+  Pin A1        IN1  ( LATCH )
+  Pin A2        IN2  ( CLK   )
+  Pin A3        IN3  ( DATA  )   
+ **** RTC on I2C bus *********
+  Pin A4        SDA
+  Pin A5        SCL
+ **** Vcc and Amp sensors ****
+  Pin A6        Read Volts
+  Pin A7        Read Current
+ **** Buttons ****************
+  Pin 0         Button B0
+  Pin 1         Button B1
+ **** 16x2 LCD 1602a *********
+  Pin 2         LCD RS
+  Pin 3         LCD E //Enable
+  Pin 4         LCD D4
+  Pin 5         LCD D5
+  Pin 6         LCD D6
+  Pin 7         LCD D7
+  GND           LCD VSS
+  GND           LCD R/W
+  GND           LCD K
+  +5V           LCD A  //Led light via variable resistor
+  +5V           LCD VDD
+  +5V -V0- GND  LCD V0 //Potentiometer: +5V and GND wiper to LCD VO
+******************************             
+ Pin 8          Speaker and LED
+ Pin 9          Relay
+**** SD Card on SPI **********
+ Pin 10         CS_SD
+ Pin 11         MOSI
+ Pin 12         MISO
+ Pin 13         CLK
+******************************/
+ 
+#include <LiquidCrystal.h>
+#include <Wire.h>
+#include <Time.h>
+#include <DS1307RTC.h>
+#include <SD.h>
+
+#define BB0        0  // bt_rx
+#define BB1        1  // bt_tx
+#define LCD_RS     2
+#define LCD_EN     3
+#define LCD_D4     4
+#define LCD_D5     5
+#define LCD_D6     6
+#define LCD_D7     7
+#define u_tone     8
+#define LED        8
+#define RELAY      9
+#define CONNECT    LOW
+#define DISCONNECT HIGH
+#define CS_SD     10
+#define _MOSI     11
+#define _MISO     12
+#define _CLK      13
+#define Therm     A0
+#define LD_1      A1
+#define LD_2      A2
+#define LD_3      A3
+#define LATCH     A1
+#define CLK       A2
+#define DATA      A3
+#define _SDA      A4
+#define _SDL      A5
+#define BatVcc    A6
+#define BatAmp    A7
+/* ************************************************************* */
+#define DivVcc     3         // R2/(R1+R2) 12/(24+12) = 1/3
+#define KRef       1107402L  // 1125300L 1.1*1023*1000 * (5000/5000) (Vcc1(voltmeter) / Vcc2(readRefVcc))
+#define OverLoad   10000000  // set OverLoad current 10 VA = 10000mV * 1000mA = 10000000
+#define AmpMax     10000     // Max mA for Current sensor
+
+// values for sensor calibration
+int amp_zero = 512;     // measured 0 load on current sensor 0 = -AmpMax , 1023 = +AmpMaxA
+int vcc_zero = 0;       // measured 0 voltage  ~0..5 V
+int RefVcc   = 5000;    // Real Internal Reference Voltage
+
+const byte samples = 5; // Count of analog sensor reads for average result with delay(wt) 
+const byte wt = 3;       // wait time in ms between samples
+  
+// Set of load resistors
+byte Res[] = {1, 2, 4, 8, 16, 32, 64, 128}; // Ohm 2^bit(0-7)
+byte loadLevel;         // bit-code for load resistors: each bit switches on resistor from array Res[]
+
+int analogStart;        // Check initial battery voltage, mV
+int breakLevel;         // set minimum battery voltage, mV
+
+int nowVcc;             // voltage, mV
+int nowAmp;             // amperage, mA
+
+unsigned int nowSec;    // testing time, sec
+unsigned long startTime;// Starting point of the actual test
+
+//String file_name;
+char     file_name[] = "btddhhmm.txt"; // ddhhmm will be replaced with Day Hour and Minute
+byte     lg;                             // result code of writing log file 0-OK, 1-Error
+
+// RTC Clock read
+tmElements_t tm;
+
+// Strings to write in log file and display on LCD
+char    l_str[] = "---------------------";
+char str_head[] = "Sec, mVolt, mAmp, tºC";
+char    s_div[] = ",";
+
+// set up variables using the SD utility library functions:
+Sd2Card  card;
+SdVolume volume;
+uint32_t volumesize;
+//SdFile   root;
+ 
+// initialize the library with the numbers of the interface pins
+LiquidCrystal lcd (LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
+ 
+/* ******************************************************************* */
+void(* resetFunc) (void) = 0; /*   declare reset function at address 0 */
+/* ******************************************************************* */
+// Read free SRAM in bytes
+int freeRam () {
+  extern int __heap_start, *__brkval;
+  int v;
+  return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval);
+}
+/* ************************************************************************* */
+/* ************************************************************************* */
+void setup() {
+  byte Wait_c;
+  
+  pinMode(BatVcc, INPUT);
+  pinMode(BatAmp, INPUT);
+  
+  pinMode(RELAY,  OUTPUT);
+  digitalWrite(RELAY, DISCONNECT);
+  
+  pinMode(LD_1,  OUTPUT);
+  pinMode(LD_2,  OUTPUT);
+  pinMode(LD_3,  OUTPUT);
+  
+  pinMode(LED,   OUTPUT);
+  pinMode(CS_SD, OUTPUT);
+  
+  pinMode(BB0,   INPUT_PULLUP);
+  pinMode(BB1,   INPUT_PULLUP);
+  
+  // DISCONNECT ALL LOADS
+  digitalWrite(LD_1, LOW);
+  digitalWrite(LD_2, LOW);
+  digitalWrite(LD_3, LOW);
+
+  // set up the LCD's number of columns and rows:
+  lcd.begin(16, 2);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F(" Battery Tester "));   // show project header
+  lcd.setCursor(0, 1);
+  lcd.print(F(" v 1.0 2014(c)  "));
+  delay(1500);
+  // *******************************************
+  lcd.setCursor(0, 1);
+  if (!SD.begin(CS_SD)) {
+    lcd.print(F("SD Error ")); 
+    lcd.print(F("Press BO "));
+    tone(u_tone, 194, 100); delay(100); noTone(u_tone);
+    while (digitalRead(BB0)) {delay(100); blink(1);}
+    resetFunc();
+  } else {
+    lcd.print(F("SD is present.")); 
+  }
+  delay(500);
+  
+  lcd.setCursor(0, 1);
+  if (!card.init(SPI_HALF_SPEED, CS_SD)) {
+    lcd.print(F("SD Error "));
+    tone(u_tone, 194, 100); delay(100); noTone(u_tone);
+    while (digitalRead(BB0)) {delay(100); blink(1);}
+    resetFunc();
+  } else {
+    // print the type of card
+    lcd.print(F("SD type: ")); 
+    switch(card.type()) {
+    case SD_CARD_TYPE_SD1:  lcd.print(F("SD1")); break;
+    case SD_CARD_TYPE_SD2:  lcd.print(F("SD2")); break;
+    case SD_CARD_TYPE_SDHC: lcd.print(F("SDHC")); break;
+    default:                lcd.print(F("Unknown"));
+    }
+  }
+  delay(500);
+  
+  // open the 'volume'/'partition' - it should be FAT16 or FAT32
+  if (!volume.init(card)) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(F("No FAT16/32 part"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Format the card."));
+    tone(u_tone, 194, 100); delay(100); noTone(u_tone);
+    while (digitalRead(BB0)) {delay(100); blink(1);}
+    //resetFunc();
+  }
+  
+  // print the type and size of the first FAT-type volume
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("Volume type is  "));
+  lcd.setCursor(0, 1);
+  lcd.print(F(" FAT "));
+  lcd.print(volume.fatType(), DEC);
+  delay(500);
+  
+  volumesize = volume.blocksPerCluster();    // clusters are collections of blocks
+  volumesize *= volume.clusterCount();       // we'll have a lot of clusters
+  volumesize *= 512;                         // SD card blocks are always 512 bytes
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("Volume size:"));
+  volumesize /= 1024;  //KB
+  lcd.setCursor(0, 1);
+  lcd.print(volumesize); 
+  lcd.print(F(" KBytes"));
+  delay(500);
+  
+  // *******************************************
+  if (RTC.read(tm)) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(F(" Battery Tester "));
+    lcd.setCursor(0, 1);
+    lcd.print(F("   RTC is OK   "));
+  } else {
+    if (RTC.chipPresent()) {
+      lcd.setCursor(0, 0);
+      lcd.print(F(" RTC stopped "));
+      lcd.setCursor(0, 1);
+      lcd.print(F("Run the SetTime"));
+    } else {
+      lcd.print(F("DS1307 read error!"));
+      }
+    tone(u_tone, 194, 100); delay(100); noTone(u_tone);
+    while (digitalRead(BB0)) {delay(100); blink(1);}
+    //resetFunc();
+  }
+  delay(500);
+  //Open file on SD card
+  //file_name = "bt"+print2digits(tm.Day)+print2digits(tm.Hour)+print2digits(tm.Minute)+".txt";
+  for (byte c=0;c<6;c++){file_name[c+2]=(print2digits(tm.Day)+print2digits(tm.Hour)+print2digits(tm.Minute))[c];}
+  
+  // log_sd returns byte=1 when OK and 0 on error (or error code)
+  if (log_sd(file_name, readRTC())) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(F("Open file on SD")); 
+    lcd.setCursor(0, 1);
+    lcd.print(file_name);
+  }
+  else {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(F("Can't open file")); 
+    lcd.setCursor(0, 1);
+    lcd.print(file_name);
+    tone(u_tone, 194, 100); delay(100); noTone(u_tone);
+    while (digitalRead(BB0)) {delay(100); blink(1);}
+    resetFunc();
+  }
+  delay(500);
+  
+  tone(u_tone, 494, 100); delay(100); noTone(u_tone);
+  
+  lcd.clear();
+  Wait_c = 7;
+  while (digitalRead(BB0) and (Wait_c > 0)) {
+    lcd.setCursor(0, 0);
+    lcd.print(F("  Temp = "));
+    lcd.print(Thermistor());
+    lcd.print(F("C"));
+    delay(600);
+    blink(1);
+    Wait_c--;
+  }
+  delay(500);  
+    
+  RefVcc = readRefVcc();
+  lcd.setCursor(0, 1);
+  lcd.print(F("RefVcc="));
+  lcd.print(RefVcc);
+  lcd.print(F(" mV"));
+  delay(2500);
+  // Set zero Amp and Vcc reading on B0 press
+  tone(u_tone, 494, 100); delay(100); noTone(u_tone);
+  lcd.clear();
+  while ( readZeroVcc() > 300 ) {
+    lcd.setCursor(0, 0);
+    lcd.print(F("Disconnecting"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("The Battery"));
+    delay(500);
+    digitalWrite(RELAY, DISCONNECT);
+  }
+  delay(1000);
+  vcc_zero = readZeroVcc();
+  amp_zero = readZeroAmp();
+  lcd.clear();
+  
+  Wait_c = 7;
+  while (digitalRead(BB0) and (Wait_c > 0)) {
+    vcc_zero = readZeroVcc();
+    amp_zero = readZeroAmp();
+    lcd.setCursor(0, 0);
+    lcd.print(F("Zero Readings  ")); lcd.print(Wait_c);
+    lcd.setCursor(0, 1);
+    lcd.print(F("zA="));
+    lcd.print(readAmp());
+    lcd.print(F(" mA  "));
+    lcd.setCursor(8, 1);
+    lcd.print(F("zV="));
+    lcd.print(readVcc());
+    lcd.print(F(" mV  ")); 
+    byte cc = 0;
+    while ( readZeroVcc() > 300 ) {
+       if (cc==0) {lcd.clear(); cc++; }
+       lcd.setCursor(0, 0);
+       lcd.print(F("Disconnecting"));
+       lcd.setCursor(0, 1);
+       lcd.print(F("The Battery"));
+       delay(500);
+       digitalWrite(RELAY, DISCONNECT);
+    }
+    delay(600);
+    blink(1);
+    Wait_c--;
+  }
+  delay(500);
+  for (byte j=1; j<=5; j++) {tone(u_tone, 294+294/j, 50); delay(50); noTone(u_tone);}
+  
+  /* ************************************************************************ */
+  // Initial readings: Connecting testing Battery
+  lcd.clear();
+  while ( readVcc() < 1000 ) {
+    digitalWrite(RELAY, DISCONNECT);
+    lcd.setCursor(0, 0);
+    lcd.print(F("Connecting"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("The Battery"));
+    delay(500);
+    digitalWrite(RELAY, CONNECT);
+  }
+  lcd.clear();
+  // ********************************************
+  // *************** test ***********************
+  /* ********************************************
+  for (loadLevel=0; loadLevel<255; loadLevel++) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(loadLevel);
+    lcd.print(F(" LL "));
+    unsigned long LL=LoadRes(loadLevel);
+    lcd.setCursor(7, 0);
+    if (LL < 1000) {
+       lcd.print(LL);
+       lcd.print(F(" mOhm"));
+    }
+    else {
+       lcd.print(LL/1000);
+       lcd.print(F(" Ohm"));
+    }
+    delay(500);
+  }
+  while (digitalRead(BB0)) {delay(500);} delay(500);
+  **************************************************************************** */
+  Wait_c = 5;
+  while (digitalRead(BB0) and (Wait_c > 0)) { 
+    analogStart = readVcc();
+    if (analogStart < 3000) {
+      breakLevel = analogStart/3;   // discharge battery to 1/3 of current level
+    }
+    else {
+      breakLevel = analogStart*2/3; // discharge battery to 2/3 of current level
+    }
+    lcd.setCursor(0, 0);
+    lcd.print(analogStart);
+    lcd.print(F(" mV to "));
+    lcd.print(breakLevel);
+    
+    loadLevel = LoadCalc(analogStart);
+    lcd.setCursor(0, 1);
+    lcd.print(loadLevel, DEC);
+    lcd.print(F(" LL "));
+    unsigned long LL=LoadRes(loadLevel);
+    lcd.setCursor(7, 1);
+    if (LL < 1000) {
+      lcd.print(LL);
+      lcd.print(F(" mOhm "));
+    }
+    else {
+      lcd.print(LL/1000);
+      lcd.print(F(" Ohm "));
+    }
+    byte cc = 0;
+    while ( readVcc() < 1000 ) {
+      if (cc==0) {lcd.clear(); cc++; }
+      digitalWrite(RELAY, DISCONNECT);
+      lcd.setCursor(0, 0);
+      lcd.print(F("Re-Connecting"));
+      lcd.setCursor(0, 1);
+      lcd.print(F("The Battery"));
+      delay(500);
+      digitalWrite(RELAY, CONNECT);
+    }
+    delay(600); 
+    blink(1);
+    Wait_c--;
+  }
+  
+  lg = log_sd(file_name, String(analogStart)+" mV to "+String(breakLevel));
+  lg = log_sd(file_name, String(loadLevel)+" bin "+String(LoadRes(loadLevel))+" Ohm");
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(readRTC());
+  lg = log_sd(file_name, l_str);
+  lg = log_sd(file_name, str_head);
+  
+  for (byte j=1; j<=5; j++) {tone(u_tone, 294+20*j, 50); delay(50); noTone(u_tone);}
+  delay(500);
+  
+} //setup()
+
+/***************************************************************************************/
+void loop() {
+  unsigned long loop_time;        // Starting point of the current cycle
+  unsigned long totalAmp = 0;     // Total capacity mA/h
+  unsigned long totalPower = 0;   // Total power mW/h
+  unsigned int  total_on_Sec = 0; // Total time under load
+
+  digitalWrite(RELAY, CONNECT);
+  total_on_Sec = 0; // reset total on time to 0 seconds
+  startTime = millis();  // start test timestamp 
+  bat_test();
+  // While voltage > breakVoltage then do testing
+  while (nowVcc > breakLevel) {
+    // Switch on Load for 55 sec
+    switch_load(B00000111/*loadLevel*/);      // 7 - full load 
+    for (byte cc = 0; cc < 55; cc++) {        // 55 sec in ON state
+      loop_time = millis()+1000;
+      bat_test();                             // measure and log results
+      // Check OverLoad VA and Temperature
+      // stop measure when it's well below break level or already 0
+      if ( (long(nowAmp*nowVcc) > OverLoad) or (Thermistor() > 45) or (nowVcc < breakLevel*2/3))
+         {break;} // stop measure if it's too much power on the load  
+      // Total values
+      totalAmp += nowAmp;                     // total capacity mA * sec
+      totalPower += long(nowAmp*nowVcc);      // total power mVA * sec
+      // Wait till end of this second
+      while (loop_time > millis()) {delay(1);} // make each cycle 1 sec long   
+      total_on_Sec++;                          // Total count of seconds in ON state
+    }
+    switch_load(LOW);
+    // Check again OverLoad VA and Temperature to cancel main loop
+    if ((long(nowAmp*nowVcc) > OverLoad) or (Thermistor() > 55))
+       {break;}
+    // Wait 5 sec with Load off
+    for (byte cc = 0; cc < 5; cc++) {         // OFF state 5 seconds
+      loop_time = millis()+1000;
+      bat_test();                             // measure and log results
+      while (loop_time > millis()){delay(1);} // make each cycle app 1000 msec long
+    }
+  }
+  // Test finished
+  switch_load(LOW); // make sure load is off
+  bat_test();       // final battery read
+  digitalWrite(RELAY, DISCONNECT);
+  // write current time from RTC
+  lg = log_sd(file_name, l_str);
+  lg = log_sd(file_name, readRTC());
+  lg = log_sd(file_name, l_str);
+  
+  totalAmp   /= 3600;   // capacity mA / hour
+  totalPower /= 3600;   // power mVA / hour
+  // write total numbers
+  lg = log_sd(file_name, String(total_on_Sec)+" sec ON");
+  lg = log_sd(file_name, String(totalAmp)+" mAh");
+  lg = log_sd(file_name, String(totalPower)+" mWh");
+  lg = log_sd(file_name, l_str);
+  
+  for (byte j=1; j<=15; j++) {tone(u_tone, 294+894/j, 70); delay(70); noTone(u_tone);}
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(readRTC());
+  lcd.setCursor(0, 1);
+  lcd.print(F("Test finished!"));
+  delay(1000);
+  lcd.setCursor(0, 1);
+  lcd.print(total_on_Sec/60); lcd.print(F("m "));
+  lcd.print(totalAmp/1000); lcd.print(F("a "));
+  lcd.print(totalPower/1000); lcd.print(F("w      "));
+  // desplay on LCD to indicate that test is complete
+  while(digitalRead(BB0)) {delay(90); lcd.setCursor(0, 0); lcd.print(readRTC());}
+  delay(550);
+  resetFunc();
+  
+} //loop()
+/* *************************************************************************** */
+
+/* *************************************************************************** */
+int readRefVcc() {
+  // Read 1.1V reference against AVcc
+  // set the reference to Vcc and the measurement to the internal 1.1V reference
+  #if defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
+    ADMUX = _BV(REFS0) | _BV(MUX4) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  #elif defined (__AVR_ATtiny24__) || defined(__AVR_ATtiny44__) || defined(__AVR_ATtiny84__)
+    ADMUX = _BV(MUX5) | _BV(MUX0);
+  #elif defined (__AVR_ATtiny25__) || defined(__AVR_ATtiny45__) || defined(__AVR_ATtiny85__)
+    ADMUX = _BV(MUX3) | _BV(MUX2);
+  #else
+    ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  #endif  
+  // make series of reading and compute average
+  unsigned long LRefVcc = 0;
+  for (int i=0; i<samples; i++) {
+    delay(wt); // Wait for Vref to settle
+    ADCSRA |= _BV(ADSC); // Start conversion
+    while (bit_is_set(ADCSRA,ADSC)); // measuring
+    uint8_t low  = ADCL; // must read ADCL first - it then locks ADCH  
+    uint8_t high = ADCH; // unlocks both
+    long result = (high<<8) | low;
+    result = KRef / result;
+    LRefVcc += result;
+  }
+  LRefVcc /= samples;
+  return (int)LRefVcc; // Vcc in mV
+}
+// ********************************************
+int readZeroVcc() {
+  unsigned long zeroVcc = 0;
+  for (int i = 0; i < samples; i++) {
+    delay(wt);
+    zeroVcc += analogRead(BatVcc);
+    }
+  zeroVcc /= samples;
+  return (int)zeroVcc;
+}
+// ********************************************
+int readVcc() {
+  unsigned long avg_vcc = 0;
+  for(byte i = 0; i < samples; i++) {
+      delay(wt);
+      avg_vcc += (long)(analogRead(BatVcc)-vcc_zero);
+      }
+  avg_vcc /= samples;
+  return map((int)avg_vcc, 0,1023, 0, RefVcc*DivVcc);
+}
+// ********************************************
+int readZeroAmp() {
+  long VQ = 0;
+  for (int i = 0; i < samples; i++) {
+    delay(wt);
+    VQ += analogRead(BatAmp);
+    }
+  VQ /= samples;
+  return (int)VQ;
+}
+// ********************************************
+int readAmp() {
+  long avg_amp = 0;
+  for(byte i = 0; i < samples; i++) {
+    delay(wt);
+    avg_amp += (long)(analogRead(BatAmp)-amp_zero);
+    }
+  avg_amp /= samples;
+  return map((int)avg_amp, -512,512, -AmpMax,AmpMax);
+}
+// ***********************************************
+// convert mV, mA to formatted string with decimal point
+//String f_str(long Val){
+//   char valF[6]; // buffer for amp incl. decimal point & possible minus sign
+//   dtostrf(Val/1000.0, 2, 2, valF); // Min. 6 chars wide incl. decimal point, 2 digits right of decimal
+//   return valF; }
+//************************************************
+
+// Show 2 digit number with leading zero (month, day, hour, minute, second)
+String print2digits(byte number) {
+  String str = "";
+  if (number >= 0 && number < 10) {
+    str += '0';
+  }
+  str += number;
+  return str;
+}
+// ***********************************************
+// Write data in the log file on the microSD card
+byte log_sd(char fn[13], String str){
+  File dataFile = SD.open(fn, FILE_WRITE);
+  // if the file is available, write to it:
+  if (dataFile) {
+    dataFile.println(str);
+    dataFile.close();
+    return 1;
+  }  
+  // if the file isn't open, pop up an error:
+  else {
+    return 0;
+  }
+}
+// ************************************************
+// blink N times with 50ms interval (adds 100ms delay per 1 blink)
+void blink (byte n) {
+  for (byte i = 1; i <= n; i++) {
+       digitalWrite(LED, HIGH);
+       delay(50);
+       digitalWrite(LED, LOW); 
+       delay(50);
+    }
+}
+// *************************************************
+// Calculate bit-code for needed parallel resistor load
+byte LoadCalc (int Vcc) { // Vcc in mV - Load resistor should drive 1000 mA of current
+   byte LoadByte = 0;
+   unsigned long Load;
+   unsigned long LoadMin = 128000; // avoid floats, internal calculations in milli Ohms
+   const int acc=200; // +/- in mA
+   for (byte i=255; i>0; i--) { // check all resistors combinations 255-0
+      Load = LoadRes(i); // avoid floats, internal calculations in milli Ohms
+      if ((Load-Vcc) <  acc) {
+         if (Load < LoadMin) {
+            LoadMin = Load;
+            LoadByte = i;
+         }
+      }
+   }
+   return LoadByte;
+}
+// **************************************************
+// Calculare result for parallel resistor load by bit-code
+// byte Res[] = {1, 2, 4, 8, 16, 32, 64, 128}; // Ohm
+long LoadRes (byte LoadByte) {
+   unsigned long LoadSum  = 0;
+   unsigned long LoadProd = 1;
+   byte bcount = 0;
+   for (byte b=0; b<8; b++) { // Test all 8 bits
+     if (bitRead(LoadByte, b)) {
+        LoadSum  += Res[b];
+        LoadProd *= Res[b];
+        bcount++;
+        // ********************************************
+        // *************** test ***********************
+        /* ********************************************
+        lcd.setCursor(0, 1);
+        lcd.print(b);
+        lcd.print(F("b-"));
+        lcd.print(Res[b]);
+        lcd.print(F(" "));
+        lcd.print(bcount);
+        lcd.print(F("   "));
+        delay(900);
+        *********************************************** */
+     }
+   }
+   // ********************************************
+   // *************** test ***********************
+   /* ********************************************
+   lcd.setCursor(0, 1);
+   lcd.print(LoadProd);
+   lcd.print(F("/"));
+   lcd.print(LoadSum);
+   lcd.print(F("           "));
+   delay(500);
+   ***********************************************/
+   // If it's only one bit set, just return the value for that bit
+   switch (bcount) {
+     case 0: return 0;
+     case 1: return (long)(LoadSum*1000); // convert from Ohm to milli Ohm
+  default  : return (long)(LoadProd*1000/LoadSum);
+  }
+}
+// **************************************************
+// Read current time from RTC
+String readRTC() {
+  RTC.read(tm);
+  //return(print2digits(tm.Day)+"/"+print2digits(tm.Month)+"/"+tmYearToY2k(tm.Year)+" "+
+  //print2digits(tm.Hour)+":"+print2digits(tm.Minute)+":"+print2digits(tm.Second));
+  return(print2digits(tm.Hour)+":"+print2digits(tm.Minute)+":"+print2digits(tm.Second)+", "+String(freeRam())+"b");
+ }
+// ***************************************************
+// Read mV and mA every 1 second
+void bat_test() {
+    // Formatted data to print on LCD and write to SD
+    String ts1 = "";
+    String ts2 = "";
+    
+    nowVcc = readVcc();                 // Get battery voltage
+    nowAmp = readAmp();                 // Get current amperage
+    nowSec = (millis()-startTime)/1000; // Get time in secs from test start
+
+    // write header
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    ts1 = readRTC();
+    lcd.print(ts1); 
+    // "sec , volt , amp, temp";
+    ts2 = String(nowSec)+s_div+String(nowVcc)+s_div+String(nowAmp)+s_div+String(Thermistor());
+    lcd.setCursor(0, 1);
+    lcd.print(ts2);
+    lg = log_sd(file_name, ts2+s_div+ts1);
+}
+// ****************************************************
+void switch_load(byte sw) {
+    digitalWrite(LED, sw);
+// send sw byte to the shift register
+//  digitalWrite(LATCH, LOW);
+//  shiftOut(DATA, CLK, MSBFIRST, sw);
+//  digitalWrite(LATCH, HIGH);
+
+// switch load by bits
+    digitalWrite(LD_1, bitRead(sw,0));
+    digitalWrite(LD_2, bitRead(sw,1));
+    digitalWrite(LD_3, bitRead(sw,2));
+/*
+// old type of direct switching load
+  if (sw == HIGH) {
+    digitalWrite(LD_1, HIGH);
+    digitalWrite(LD_2, HIGH);
+    digitalWrite(LD_3, HIGH);
+  }
+  else {
+    digitalWrite(LD_1, LOW);
+    digitalWrite(LD_2, LOW);    
+    digitalWrite(LD_3, LOW);
+  }
+*/
+}
+// Connecting Thermoresistor to Arduino
+// Schematic:
+// [Gnd] ---- [R8.6K] ---|----- [Thermistor] ---- [+5v]
+//                       |
+//                       A0
+// Utilizes the Steinhart-Hart Thermistor Equation:
+// Temperature in Kelvin = 1 / {A + B[ln(R)] + C[ln(R)]^3}
+// where A = 0.001129148, B = 0.000234125 and C = 8.76741E-08
+int Thermistor() {
+  const double R = 8600;
+  double Temp;
+  double avg_temp = 0;
+  for(byte i = 0; i < samples; i++) {
+    Temp = log(((R*1024.0)/analogRead(Therm))-R); // for pull-up configuration
+    Temp = 1 / (0.001129148 + (0.000234125 + (0.0000000876741 * Temp * Temp )) * Temp );
+    Temp = Temp - 273.15;        // Convert Kelvin to Celcius
+    //Temp = (Temp * 9)/ 5 + 32; // Convert Celcius to Fahrenheit
+    avg_temp += Temp;
+    delay(wt);
+    }
+    avg_temp /= samples;
+  return (int)avg_temp;
+}
+// ==============================================================================
